@@ -1,7 +1,7 @@
 /**
  * Disk Ball
  * Throw 3.5" floppies into the office trash can.
- * Loaded by index.html. Every graphic is drawn in code.
+ * Loaded by index.html. The room is drawn in code. The disk and can are photos.
  *
  * Drag the floppy in the direction of the throw, then release.
  *
@@ -64,6 +64,9 @@ const LAYOUT = {
   monitorY: 258,
   monitorW: 176,
   monitorH: 136,
+  towerX: 268,
+  towerW: 78,
+  towerH: 146,
   canX: 790,
   rimY: 350,
   mouthHalf: 32,
@@ -74,13 +77,21 @@ const LAYOUT = {
   innerRy: 10
 };
 
+// Fractions of the cropped tower.png: monitor, case, glass, and the floppy slot.
+const SETUP = {
+  monitor: { x: 0.052, y: 0, w: 0.518, h: 0.745 },
+  tower: { x: 0.625, y: 0.116, w: 0.374, h: 0.629 },
+  screen: { x: 0.112, y: 0.106, w: 0.394, h: 0.346 },
+  slot: { x: 0.699, y: 0.398, w: 0.242, h: 0.029 }
+};
+
 // The physics circle is smaller than the art and bottom-aligned, so the disk
 // can drop through the mouth while still sitting flush on the desk.
 const DISK = {
-  size: 44,
-  radius: 15,
-  offsetX: 7,
-  offsetY: 14
+  size: 28,
+  radius: 10,
+  offsetX: 4,
+  offsetY: 9
 };
 
 const AIM = {
@@ -104,13 +115,6 @@ const DEPTH = {
   overlay: 40
 };
 
-const SHELLS = [
-  { key: 'floppy-black', color: 0x2c2e33 },
-  { key: 'floppy-blue', color: 0x3f5e86 },
-  { key: 'floppy-beige', color: 0xd4c4a0 },
-  { key: 'floppy-red', color: 0x8d4542 }
-];
-
 const UI_FONT = 'Courier New, Courier, monospace';
 
 // ---------------------------------------------------------------------------
@@ -123,7 +127,6 @@ class OfficeScene extends Phaser.Scene {
     this.phase = 'ready';
     this.score = 0;
     this.disksLeft = ROUND_SIZE;
-    this.shellIndex = 0;
     this.disk = null;
     this.boundColliders = [];
     this.drag = null;
@@ -132,13 +135,31 @@ class OfficeScene extends Phaser.Scene {
     this.callout = null;
   }
 
+  preload() {
+    this.load.image('floppy', 'assets/white-disk.png');
+    this.load.image('trashcan', 'assets/trash-can.png');
+    this.load.image('tower', 'assets/tower.png');
+    this.load.image('desk', 'assets/desk.png');
+  }
+
   create() {
+    const floppyFrame = this.cutCheckerboard('floppy');
+    const canFrame = this.cutCheckerboard('trashcan');
+    this.textures.get('floppy').add('disk', 0, floppyFrame.x, floppyFrame.y, floppyFrame.w, floppyFrame.h);
+    this.textures.get('trashcan').add('can', 0, canFrame.x, canFrame.y, canFrame.w, canFrame.h);
+    const deskFrame = this.cutCheckerboard('desk');
+    const towerFrame = this.cutCheckerboard('tower');
+    this.textures.get('desk').add('top', 0, deskFrame.x, deskFrame.y, deskFrame.w, deskFrame.h);
+    this.textures.get('tower').add('setup', 0, towerFrame.x, towerFrame.y, towerFrame.w, towerFrame.h);
+    this.canFrame = canFrame;
+    this.deskFrame = deskFrame;
+    this.towerFrame = towerFrame;
+
     this.drawRoom();
-    this.drawDesk();
-    this.drawMonitor();
-    this.drawCan();
+    this.placeDesk();
+    this.placeSetup();
+    this.placeCan();
     this.makeSolids();
-    this.makeFloppyTextures();
 
     this.aimGfx = this.add.graphics().setDepth(DEPTH.aim);
     this.createHud();
@@ -163,6 +184,13 @@ class OfficeScene extends Phaser.Scene {
       return;
     }
 
+    if (disk.getData('seekingSlot')) {
+      if (this.pullTowardSlot(disk, delta)) {
+        this.resolveDrive();
+        return;
+      }
+    }
+
     if (disk.x < -90 || disk.x > WIDTH + 90 || disk.y > HEIGHT + 40) {
       this.resolveMiss();
       return;
@@ -172,15 +200,20 @@ class OfficeScene extends Phaser.Scene {
     const bottom = body.center.y + body.halfHeight;
     const overDesk = disk.x >= LAYOUT.deskX && disk.x <= LAYOUT.deskX + LAYOUT.deskW;
     const onDesk = overDesk && bottom >= LAYOUT.deskY - 6 && bottom <= LAYOUT.deskY + 36;
-    const onMonitor = disk.x >= LAYOUT.monitorX
-      && disk.x <= LAYOUT.monitorX + LAYOUT.monitorW
-      && bottom >= LAYOUT.monitorY - 6
-      && bottom <= LAYOUT.monitorY + 24;
+    const onMonitor = disk.x >= this.monitorHit.x
+      && disk.x <= this.monitorHit.x + this.monitorHit.w
+      && bottom >= this.monitorHit.y - 6
+      && bottom <= this.monitorHit.y + 24;
+    const onTower = disk.x >= this.towerHit.x
+      && disk.x <= this.towerHit.x + this.towerHit.w
+      && bottom >= this.towerHit.y - 6
+      && bottom <= this.towerHit.y + 24;
     const onFloor = bottom >= LAYOUT.floorY - 8;
     const againstCan = (disk.getData('hitRim') || disk.getData('surface') === 'can') && bottom >= LAYOUT.rimY;
     // Only settle on a real surface. A low vertical speed in mid-air is just the top of the arc.
-    const supported = body.blocked.down && (onDesk || onFloor || onMonitor || againstCan);
-    if (supported && this.flightMs > 160) {
+    // A disk already steered at the drive keeps flying until it reaches the slot.
+    const supported = body.blocked.down && (onDesk || onFloor || onMonitor || onTower || againstCan);
+    if (!disk.getData('seekingSlot') && supported && this.flightMs > 160) {
       body.velocity.x *= 0.86;
       if (Math.hypot(body.velocity.x, body.velocity.y) < 72) {
         this.resolveMiss();
@@ -221,146 +254,191 @@ class OfficeScene extends Phaser.Scene {
     g.strokePath();
   }
 
-  drawDesk() {
-    const g = this.add.graphics().setDepth(DEPTH.desk);
-    const { deskX: x, deskY: y, deskW: w, deskH: h } = LAYOUT;
-
-    g.fillStyle(PAL.deskLeg, 1);
-    g.fillRect(x + 28, y + h, 16, LAYOUT.floorY - 26 - (y + h));
-    g.fillRect(x + w - 52, y + h, 16, LAYOUT.floorY - 26 - (y + h));
-
-    g.fillStyle(PAL.desk, 1);
-    g.fillRect(x, y, w, h);
-    g.fillStyle(PAL.deskFront, 1);
-    g.fillRect(x, y + h, w, 10);
-
-    g.lineStyle(2, PAL.ink, 1);
-    g.strokeRect(x, y, w, h + 10);
-    g.lineStyle(1, 0xc49262, 0.7);
-    g.beginPath();
-    g.moveTo(x + 16, y + 6);
-    g.lineTo(x + w - 16, y + 6);
-    g.strokePath();
+  placeDesk() {
+    const frame = this.deskFrame;
+    const displayW = 450;
+    const naturalH = displayW * (frame.h / frame.w);
+    // Wider than the photo, and a little taller so the top has more depth.
+    const displayH = naturalH * 0.8;
+    const lip = displayH * 0.31;
+    const bottom = LAYOUT.floorY + displayH * 0.12;
+    const top = bottom - displayH;
+    LAYOUT.deskX = 48;
+    LAYOUT.deskW = displayW;
+    LAYOUT.deskY = top + lip;
+    this.deskInset = 28;
+    const desk = this.add.image(LAYOUT.deskX + displayW / 2, top + displayH / 2, 'desk', 'top');
+    desk.setDisplaySize(displayW, displayH);
+    desk.setDepth(DEPTH.desk);
   }
 
-  drawMonitor() {
-    const g = this.add.graphics().setDepth(DEPTH.monitor);
-    const x = LAYOUT.monitorX;
-    const y = LAYOUT.monitorY;
-    const w = LAYOUT.monitorW;
-    const h = LAYOUT.monitorH;
+  placeSetup() {
+    const frame = this.towerFrame;
+    const displayW = 196;
+    const displayH = displayW * (frame.h / frame.w);
+    const left = LAYOUT.deskX + 36;
+    const top = LAYOUT.deskY - this.deskInset - displayH;
+    const setup = this.add.image(left + displayW / 2, top + displayH / 2, 'tower', 'setup');
+    setup.setDisplaySize(displayW, displayH);
+    setup.setDepth(DEPTH.monitor);
+    this.setupRect = { left, top, w: displayW, h: displayH };
+    this.monitorHit = this.setupPart(SETUP.monitor);
+    this.towerHit = this.setupPart(SETUP.tower);
+    const deskRight = LAYOUT.deskX + LAYOUT.deskW;
+    LAYOUT.spawnX = deskRight - DISK.size / 2 - 72;
 
-    g.fillStyle(PAL.bezel, 1);
-    g.fillRoundedRect(x, y, w, h, 6);
-    g.lineStyle(2, PAL.ink, 1);
-    g.strokeRoundedRect(x, y, w, h, 6);
-
-    const sx = x + 14;
-    const sy = y + 14;
-    const sw = w - 28;
-    const sh = h - 40;
-    g.fillStyle(PAL.bezelInner, 1);
-    g.fillRect(sx - 3, sy - 3, sw + 6, sh + 6);
-    g.fillStyle(PAL.screen, 1);
-    g.fillRect(sx, sy, sw, sh);
-
-    g.fillStyle(0x000000, 0.18);
-    for (let row = sy + 3; row < sy + sh; row += 4) {
-      g.fillRect(sx, row, sw, 1);
-    }
-
-    g.fillStyle(0x8fea72, 1);
-    g.fillCircle(x + w - 18, y + h - 16, 4);
-    g.lineStyle(1, PAL.ink, 1);
-    g.strokeCircle(x + w - 18, y + h - 16, 4);
-
-    g.fillStyle(PAL.bezel, 1);
-    g.fillRect(x + w / 2 - 16, y + h, 32, 12);
-    g.fillRect(x + w / 2 - 36, y + h + 12, 72, 8);
-    g.lineStyle(2, PAL.ink, 1);
-    g.strokeRect(x + w / 2 - 36, y + h + 12, 72, 8);
-
-    this.crtText = this.add.text(sx + 10, sy + 12, 'C:\\>', {
+    const screen = this.setupPart(SETUP.screen);
+    this.crtText = this.add.text(screen.x + 6, screen.y + 6, 'C:\\>', {
       fontFamily: UI_FONT,
-      fontSize: '16px',
+      fontSize: '11px',
       color: '#b6ff8a'
-    }).setDepth(DEPTH.monitor).setResolution(2);
+    }).setDepth(DEPTH.monitor + 1).setResolution(2);
+    this.crtHome = { x: this.crtText.x, y: this.crtText.y };
+    this.crtInfected = false;
+
+    this.skull = this.add.graphics().setDepth(DEPTH.monitor + 1).setVisible(false);
+    this.drawSkull(this.skull, screen.x + screen.w - 18, screen.y + screen.h - 20);
 
     this.time.addEvent({
       delay: 520,
       loop: true,
       callback: () => {
+        if (this.crtInfected) return;
         const showing = this.crtText.text.endsWith('_');
         this.crtText.setText(showing ? 'C:\\>' : 'C:\\>_');
       }
     });
   }
 
-  drawCan() {
-    const back = this.add.graphics().setDepth(DEPTH.canBack);
-    const front = this.add.graphics().setDepth(DEPTH.canFront);
-    const cx = LAYOUT.canX;
-    const ry = LAYOUT.rimY;
-    const top = ry + 8;
-    const bot = LAYOUT.floorY - 2;
-    const topHalf = 76;
-    const botHalf = 58;
-
-    back.fillStyle(0x000000, 0.15);
-    back.fillEllipse(cx, bot, botHalf * 2.2, 14);
-
-    back.fillStyle(PAL.can, 1);
-    back.beginPath();
-    back.moveTo(cx - topHalf, top);
-    back.lineTo(cx + topHalf, top);
-    back.lineTo(cx + botHalf, bot);
-    back.lineTo(cx - botHalf, bot);
-    back.closePath();
-    back.fillPath();
-
-    back.fillStyle(PAL.canShade, 1);
-    back.beginPath();
-    back.moveTo(cx + 10, top);
-    back.lineTo(cx + topHalf, top);
-    back.lineTo(cx + botHalf, bot);
-    back.lineTo(cx + 6, bot);
-    back.closePath();
-    back.fillPath();
-
-    back.lineStyle(2, PAL.ink, 1);
-    back.beginPath();
-    back.moveTo(cx - topHalf, top);
-    back.lineTo(cx + topHalf, top);
-    back.lineTo(cx + botHalf, bot);
-    back.lineTo(cx - botHalf, bot);
-    back.closePath();
-    back.strokePath();
-
-    // Far lip, then the dark opening. The disk drops between this and the near lip.
-    back.lineStyle(8, PAL.rim, 1);
-    this.strokeArc(back, cx, ry, LAYOUT.outerRx, LAYOUT.outerRy, Math.PI, Math.PI * 2, 18);
-
-    back.fillStyle(PAL.mouth, 1);
-    back.fillEllipse(cx, ry + 2, LAYOUT.innerRx * 2, LAYOUT.innerRy * 2);
-    back.fillStyle(0x0c0d0f, 1);
-    back.fillEllipse(cx, ry + 6, LAYOUT.innerRx * 1.5, LAYOUT.innerRy * 1.2);
-
-    front.lineStyle(9, PAL.rim, 1);
-    this.strokeArc(front, cx, ry, LAYOUT.outerRx, LAYOUT.outerRy, 0, Math.PI, 18);
-    front.lineStyle(3, PAL.rimLit, 1);
-    this.strokeArc(front, cx, ry + 2, LAYOUT.outerRx - 8, LAYOUT.outerRy - 4, 0.25, Math.PI - 0.25, 14);
+  setupPart(part) {
+    const s = this.setupRect;
+    return {
+      x: s.left + s.w * part.x,
+      y: s.top + s.h * part.y,
+      w: s.w * part.w,
+      h: s.h * part.h
+    };
   }
 
-  strokeArc(g, cx, cy, rx, ry, a0, a1, steps) {
-    g.beginPath();
-    for (let i = 0; i <= steps; i++) {
-      const t = a0 + ((a1 - a0) * i) / steps;
-      const x = cx + Math.cos(t) * rx;
-      const y = cy + Math.sin(t) * ry;
-      if (i === 0) g.moveTo(x, y);
-      else g.lineTo(x, y);
+  drawSkull(g, x, y) {
+    g.fillStyle(0xd7ffb0, 1);
+    g.fillCircle(x, y, 11);
+    g.fillStyle(PAL.screen, 1);
+    g.fillRect(x - 7, y - 4, 4, 4);
+    g.fillRect(x + 3, y - 4, 4, 4);
+    g.fillRect(x - 1, y + 2, 2, 3);
+    g.fillRect(x - 6, y + 7, 12, 3);
+    g.fillStyle(0xd7ffb0, 1);
+    g.fillRect(x - 4, y + 7, 1, 3);
+    g.fillRect(x - 1, y + 7, 1, 3);
+    g.fillRect(x + 2, y + 7, 1, 3);
+  }
+
+  // The drive slot on the tower.png case.
+  floppySlotRect() {
+    const slot = this.setupPart(SETUP.slot);
+    return {
+      x: slot.x,
+      y: slot.y,
+      w: slot.w,
+      h: slot.h,
+      cx: slot.x + slot.w / 2,
+      cy: slot.y + slot.h / 2
+    };
+  }
+
+  // The photos bake in a checkerboard. Clear only the background connected to the edge.
+  cutCheckerboard(key) {
+    const source = this.textures.get(key).getSourceImage();
+    const w = source.width;
+    const h = source.height;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(source, 0, 0);
+    const image = ctx.getImageData(0, 0, w, h);
+    const data = image.data;
+    const open = new Uint8Array(w * h);
+    const at = (x, y) => y * w + x;
+    for (let i = 0; i < w * h; i++) {
+      const p = i * 4;
+      const r = data[p];
+      const g = data[p + 1];
+      const b = data[p + 2];
+      if (Math.abs(r - g) < 18 && Math.abs(g - b) < 18 && r > 198) open[i] = 1;
     }
-    g.strokePath();
+    const stack = [];
+    const push = (x, y) => {
+      const i = at(x, y);
+      if (!open[i]) return;
+      open[i] = 0;
+      stack.push(i);
+    };
+    for (let x = 0; x < w; x++) {
+      push(x, 0);
+      push(x, h - 1);
+    }
+    for (let y = 0; y < h; y++) {
+      push(0, y);
+      push(w - 1, y);
+    }
+    while (stack.length) {
+      const i = stack.pop();
+      data[i * 4 + 3] = 0;
+      const x = i % w;
+      const y = (i - x) / w;
+      if (x > 0) push(x - 1, y);
+      if (x + 1 < w) push(x + 1, y);
+      if (y > 0) push(x, y - 1);
+      if (y + 1 < h) push(x, y + 1);
+    }
+    for (let y = 0; y < h; y++) data[(y * w + (w - 1)) * 4 + 3] = 0;
+    ctx.putImageData(image, 0, 0);
+
+    const rowCount = new Uint32Array(h);
+    const colCount = new Uint32Array(w);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (data[(y * w + x) * 4 + 3] === 0) continue;
+        rowCount[y] += 1;
+        colCount[x] += 1;
+      }
+    }
+    let minX = w;
+    let minY = h;
+    let maxX = 0;
+    let maxY = 0;
+    for (let y = 0; y < h; y++) {
+      if (rowCount[y] < 24) continue;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    for (let x = 0; x < w; x++) {
+      if (colCount[x] < 24) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+    }
+    this.textures.remove(key);
+    this.textures.addCanvas(key, canvas);
+    return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+  }
+
+  placeCan() {
+    const canH = 118;
+    const bottom = LAYOUT.floorY - 2;
+    const top = bottom - canH;
+    const canW = canH * (this.canFrame.w / this.canFrame.h);
+    LAYOUT.outerRy = 11;
+    LAYOUT.outerRx = canW / 2;
+    LAYOUT.rimY = top + LAYOUT.outerRy;
+    LAYOUT.mouthHalf = 20;
+    LAYOUT.mouthLine = LAYOUT.rimY + 10;
+    LAYOUT.innerRx = 21;
+    LAYOUT.innerRy = 6;
+    const can = this.add.image(LAYOUT.canX, bottom - canH / 2, 'trashcan', 'can');
+    can.setDisplaySize(canW, canH);
+    can.setDepth(DEPTH.canFront);
   }
 
   // Invisible static rectangles. Arcade debug draws them when DEBUG is on.
@@ -385,10 +463,17 @@ class OfficeScene extends Phaser.Scene {
     );
 
     this.monitorBody = this.solid(
-      LAYOUT.monitorX + LAYOUT.monitorW / 2,
-      LAYOUT.monitorY + LAYOUT.monitorH / 2,
-      LAYOUT.monitorW,
-      LAYOUT.monitorH
+      this.monitorHit.x + this.monitorHit.w / 2,
+      this.monitorHit.y + this.monitorHit.h / 2,
+      this.monitorHit.w,
+      this.monitorHit.h
+    );
+
+    this.towerBody = this.solid(
+      this.towerHit.x + this.towerHit.w / 2,
+      this.towerHit.y + this.towerHit.h / 2,
+      this.towerHit.w,
+      this.towerHit.h
     );
 
     const rimW = 18;
@@ -396,70 +481,31 @@ class OfficeScene extends Phaser.Scene {
     this.rimL = this.solid(LAYOUT.canX - LAYOUT.mouthHalf - rimW / 2, LAYOUT.rimY, rimW, rimH);
     this.rimR = this.solid(LAYOUT.canX + LAYOUT.mouthHalf + rimW / 2, LAYOUT.rimY, rimW, rimH);
 
-    const wallW = 16;
-    const wallTop = LAYOUT.rimY + 10;
+    const wallW = 14;
+    const wallTop = LAYOUT.rimY + 8;
     const wallH = LAYOUT.floorY - wallTop;
     const wallY = wallTop + wallH / 2;
+    const wallX = LAYOUT.outerRx * 0.94;
     // Walls sit outside the mouth, so a centered shot falls in and a wide shot bounces.
-    this.wallL = this.solid(LAYOUT.canX - 68, wallY, wallW, wallH);
-    this.wallR = this.solid(LAYOUT.canX + 68, wallY, wallW, wallH);
+    this.wallL = this.solid(LAYOUT.canX - wallX, wallY, wallW, wallH);
+    this.wallR = this.solid(LAYOUT.canX + wallX, wallY, wallW, wallH);
   }
 
   // -------------------------------------------------------------------------
   // 4. Floppies
   // -------------------------------------------------------------------------
 
-  makeFloppyTextures() {
-    SHELLS.forEach((shell) => this.drawFloppy(shell.key, shell.color));
-  }
-
-  drawFloppy(key, shell) {
-    const g = this.make.graphics({ add: false });
-    const s = DISK.size;
-
-    g.fillStyle(shell, 1);
-    g.fillRoundedRect(1, 1, s - 2, s - 2, 5);
-    g.lineStyle(2, PAL.ink, 1);
-    g.strokeRoundedRect(1, 1, s - 2, s - 2, 5);
-
-    g.fillStyle(PAL.label, 1);
-    g.fillRoundedRect(6, 5, s - 12, 18, 2);
-    g.lineStyle(1, PAL.ink, 1);
-    g.strokeRoundedRect(6, 5, s - 12, 18, 2);
-
-    g.lineStyle(1, 0xc9bfb0, 1);
-    g.beginPath();
-    g.moveTo(10, 11);
-    g.lineTo(s - 10, 11);
-    g.moveTo(10, 15);
-    g.lineTo(s - 16, 15);
-    g.moveTo(10, 19);
-    g.lineTo(s - 20, 19);
-    g.strokePath();
-
-    // Metal shutter, slid shut, with the dark window still visible.
-    g.fillStyle(PAL.shutter, 1);
-    g.fillRect(10, 28, 24, 13);
-    g.lineStyle(2, PAL.ink, 1);
-    g.strokeRect(10, 28, 24, 13);
-    g.fillStyle(PAL.slot, 1);
-    g.fillRect(16, 30, 10, 9);
-    g.fillStyle(0xe4e8ec, 1);
-    g.fillRect(12, 30, 3, 9);
-
-    g.fillStyle(shell, 1);
-    g.fillRect(s - 8, 4, 4, 5);
-
-    g.generateTexture(key, s, s);
-    g.destroy();
-  }
-
   spawnDisk() {
-    const shell = SHELLS[this.shellIndex % SHELLS.length];
-    this.shellIndex += 1;
-    const y = LAYOUT.deskY - DISK.size / 2 - 1;
-    const disk = this.physics.add.sprite(LAYOUT.spawnX, y, shell.key);
-    disk.setCircle(DISK.radius, DISK.offsetX, DISK.offsetY);
+    const y = LAYOUT.deskY - 10 - DISK.size / 2;
+    const disk = this.physics.add.sprite(LAYOUT.spawnX, y, 'floppy', 'disk');
+    const scale = DISK.size / Math.max(disk.frame.width, disk.frame.height);
+    disk.setScale(scale);
+    // Circle values are in source pixels. Arcade multiplies them by the sprite scale.
+    const radius = DISK.radius / scale;
+    const drop = DISK.offsetY + DISK.radius - DISK.size / 2;
+    const offsetX = disk.frame.width / 2 - radius;
+    const offsetY = disk.frame.height / 2 + (drop - DISK.radius) / scale;
+    disk.setCircle(radius, offsetX, offsetY);
     disk.body.updateFromGameObject();
     disk.setDepth(DEPTH.disk);
     disk.setBounce(0.28);
@@ -490,6 +536,13 @@ class OfficeScene extends Phaser.Scene {
       this.physics.add.collider(disk, this.floor, (f) => f.setData('surface', 'floor'), soft),
       this.physics.add.collider(disk, this.deskBody, (f) => f.setData('surface', 'desk'), soft),
       this.physics.add.collider(disk, this.monitorBody, (f) => f.setData('surface', 'monitor'), soft),
+      this.physics.add.collider(disk, this.towerBody, (f) => f.setData('surface', 'tower'), (floppy) => {
+        if (floppy.getData('seekingSlot')) {
+          floppy.setBounce(0);
+          return true;
+        }
+        return soft(floppy);
+      }),
       this.physics.add.collider(disk, this.rimL, (f) => f.setData('hitRim', true), rim),
       this.physics.add.collider(disk, this.rimR, (f) => f.setData('hitRim', true), rim),
       this.physics.add.collider(disk, this.wallL, (f) => f.setData('surface', 'can'), soft),
@@ -674,9 +727,154 @@ class OfficeScene extends Phaser.Scene {
     });
   }
 
+  // Once a throw has failed, the disk veers into the floppy slot instead of settling.
+  trySlotRedirect(disk) {
+    if (disk.getData('driveRolled') || disk.getData('seekingSlot')) return false;
+    if (disk.x < 30 || disk.x > WIDTH - 30 || disk.y < 20 || disk.y > HEIGHT - 20) return false;
+    const slot = this.floppySlotRect();
+    if (Math.hypot(slot.cx - disk.x, slot.cy - disk.y) < 28) return false;
+    disk.setData('driveRolled', true);
+
+    const aim = this.slotAim(disk);
+    const dx = aim.x - disk.x;
+    const dy = aim.y - disk.y;
+    const dist = Math.hypot(dx, dy);
+    const speed = 540;
+    const side = disk.x < this.towerHit.x + this.towerHit.w / 2 ? -1 : 1;
+    disk.setData('seekingSlot', true);
+    disk.setData('slotSide', side);
+    disk.setData('surface', null);
+    disk.setVelocity((dx / dist) * speed, (dy / dist) * speed);
+    disk.setAngularVelocity(Math.sign(dx || 1) * 360);
+    this.flightMs = 0;
+    return true;
+  }
+
+  // A point just in front of the slot, on the side the disk is coming from.
+  slotAim(disk) {
+    const slot = this.floppySlotRect();
+    const side = disk.getData('slotSide')
+      || (disk.x < this.towerHit.x + this.towerHit.w / 2 ? -1 : 1);
+    const x = side < 0 ? this.towerHit.x - 22 : this.towerHit.x + this.towerHit.w + 22;
+    return { x, y: slot.cy, slot };
+  }
+
+  // Nudges the steered disk toward the slot each frame. Gravity still acts.
+  pullTowardSlot(disk, delta) {
+    const aim = this.slotAim(disk);
+    const dx = aim.x - disk.x;
+    const dy = aim.y - disk.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 18 && Math.abs(disk.y - aim.y) < 12) return true;
+
+    const speed = 540;
+    const vx = (dx / dist) * speed;
+    const vy = (dy / dist) * speed;
+    const blend = 1 - Math.exp(-delta / 140);
+    disk.body.velocity.x += (vx - disk.body.velocity.x) * blend;
+    disk.body.velocity.y += (vy - disk.body.velocity.y) * blend;
+    return false;
+  }
+
+  resolveDrive() {
+    const disk = this.disk;
+    if (!disk || this.phase !== 'flying') return;
+    this.phase = 'resolving';
+
+    const slot = this.floppySlotRect();
+    this.clearBindings();
+    this.physics.world.disable(disk);
+    disk.setDepth(DEPTH.disk);
+
+    this.tweens.add({
+      targets: disk,
+      x: slot.cx,
+      y: slot.cy,
+      scaleX: 0.55,
+      scaleY: 0.12,
+      angle: 0,
+      alpha: 0,
+      duration: 280,
+      ease: 'Cubic.easeIn',
+      onComplete: () => {
+        disk.destroy();
+        if (this.disk === disk) this.disk = null;
+        this.playVirus();
+      }
+    });
+  }
+
+  // The disk that finds the slot formats the score.
+  playVirus() {
+    this.crtInfected = true;
+    this.crtText.setPosition(this.crtHome.x, this.crtHome.y);
+    this.crtText.setFontSize(10);
+    this.crtText.setColor('#ff6a62');
+    this.crtText.setText('VIRUS DETECTED');
+    this.skull.setVisible(true);
+    this.cameras.main.flash(140, 190, 36, 42);
+    this.glitchBuzz();
+
+    this.score = 0;
+    this.refreshHud();
+    this.say('Score formatted.', WIDTH / 2, 128);
+
+    this.time.delayedCall(220, () => {
+      if (!this.crtInfected) return;
+      this.cameras.main.flash(180, 170, 24, 32);
+      this.crtText.setText('A:> FORMAT C:');
+    });
+
+    const homeX = this.crtHome.x;
+    this.time.addEvent({
+      delay: 45,
+      repeat: 7,
+      callback: () => {
+        if (!this.crtInfected) return;
+        this.crtText.x = homeX + Phaser.Math.Between(-3, 3);
+      }
+    });
+
+    this.time.delayedCall(1100, () => {
+      const resume = this.phase === 'resolving';
+      this.restoreCrt();
+      if (resume) this.afterShot();
+    });
+  }
+
+  restoreCrt() {
+    if (!this.crtText) return;
+    this.crtInfected = false;
+    this.skull.setVisible(false);
+    this.crtText.setPosition(this.crtHome.x, this.crtHome.y);
+    this.crtText.setFontSize(11);
+    this.crtText.setColor('#b6ff8a');
+    this.crtText.setText('C:\\>');
+  }
+
+  glitchBuzz() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!this.audio) this.audio = new Ctx();
+    const ctx = this.audio;
+    if (ctx.state === 'suspended') ctx.resume();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(180, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(55, ctx.currentTime + 0.2);
+    gain.gain.setValueAtTime(0.04, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.22);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.22);
+  }
+
   resolveMiss() {
     const disk = this.disk;
     if (!disk || this.phase !== 'flying') return;
+    if (this.trySlotRedirect(disk)) return;
     this.phase = 'resolving';
 
     const message = this.missText(disk);
@@ -705,6 +903,7 @@ class OfficeScene extends Phaser.Scene {
     if (surface === 'can') return 'Clank';
     if (surface === 'desk') return 'On the desk';
     if (surface === 'monitor') return 'On the monitor';
+    if (surface === 'tower') return 'On the tower';
     return 'Brick';
   }
 
@@ -721,6 +920,7 @@ class OfficeScene extends Phaser.Scene {
   }
 
   restartRound() {
+    this.restoreCrt();
     if (this.callout) {
       this.callout.destroy();
       this.callout = null;
@@ -732,7 +932,6 @@ class OfficeScene extends Phaser.Scene {
     }
     this.score = 0;
     this.disksLeft = ROUND_SIZE;
-    this.shellIndex = 0;
     this.roundText.setVisible(false);
     this.hint.setVisible(true);
     this.scoreText.setScale(1);
